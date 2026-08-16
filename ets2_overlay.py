@@ -70,6 +70,22 @@ def read_telemetry():
         wear_avg  = (data["wearEngine"] + data["wearTransmission"] + data["wearCabin"]
                      + data["wearChassis"] + data["wearWheels"]) / 5
 
+        # Ankunftszeit: routeTime (Sekunden Restfahrzeit) auf time_abs
+        # (aktuelle Spielzeit in Minuten) aufaddieren -> Ankunftsuhrzeit
+        eta_str = "--"
+        remaining_str = "--"
+        if data.get("onJob") and data["routeTime"] > 0:
+            remaining_min = data["routeTime"] / 60.0
+            remaining_str = f"{int(remaining_min // 60)}:{int(remaining_min % 60):02d} h"
+
+            time_abs = data["time_abs"]
+            eta_abs  = time_abs + remaining_min
+            day_offset = int(eta_abs // 1440) - int(time_abs // 1440)
+            tod = eta_abs % 1440
+            eta_str = f"{int(tod // 60):02d}:{int(tod % 60):02d}"
+            if day_offset > 0:
+                eta_str += f" +{day_offset}T"
+
         return {
             "speed":     speed_kmh,
             "rpm":       data["engineRpm"],
@@ -79,6 +95,8 @@ def read_telemetry():
             "truck_dmg": wear_avg * 100,
             "engine":    bool(data["engineEnabled"]),
             "paused":    bool(data["paused"]),
+            "eta":       eta_str,
+            "remaining": remaining_str,
         }
     except Exception:
         # Shared Memory evtl. verschwunden (Spiel beendet) -> beim naechsten Mal neu verbinden
@@ -327,6 +345,8 @@ class ETS2Overlay:
         self.lbl_rpm        = row(main, "Drehzahl")
         self.lbl_fuel       = row(main, "Kraftstoff")
         self.lbl_dmg        = row(main, "Schaden")
+        self.lbl_eta        = row(main, "Ankunft")
+        self.lbl_remaining  = row(main, "Restzeit")
 
         # Footer
         tk.Frame(self.root, bg="#222233", height=1).pack(fill=tk.X, pady=(4, 0))
@@ -412,7 +432,7 @@ class ETS2Overlay:
         if ets is None:
             self.lbl_ets_status.config(text="Warten...", fg="#888888")
             for lbl in (self.lbl_speed, self.lbl_gear, self.lbl_rpm,
-                        self.lbl_fuel, self.lbl_dmg):
+                        self.lbl_fuel, self.lbl_dmg, self.lbl_eta, self.lbl_remaining):
                 lbl.config(text="--", fg="#888888")
         else:
             status = "⏸ Pause" if ets["paused"] else ("▶ Läuft" if ets["engine"] else "Motor aus")
@@ -426,6 +446,8 @@ class ETS2Overlay:
             self.lbl_dmg.config(
                 text=f"{ets['truck_dmg']:.1f} %",
                 fg=color_dmg(ets["truck_dmg"]))
+            self.lbl_eta.config(text=ets["eta"], fg="#4FC3F7" if ets["eta"] != "--" else "#888888")
+            self.lbl_remaining.config(text=ets["remaining"], fg="#FFFFFF" if ets["remaining"] != "--" else "#888888")
 
         # Log-Status Footer aktualisieren
         if self._logging_on:
