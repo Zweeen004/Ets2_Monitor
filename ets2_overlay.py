@@ -9,8 +9,6 @@ Log-CSV landet auf dem Desktop: ets2_monitor_log_DATUM.csv
 
 import tkinter as tk
 import ctypes
-import mmap
-import struct
 import threading
 import time
 import psutil
@@ -27,61 +25,64 @@ try:
 except Exception:
     NVML_AVAILABLE = False
 
-# ──────────────────────────────────────────────
-# ETS2 Shared Memory Layout (SCS Telemetry SDK)
-# Offset-Referenz: scs-telemetry/src/scs-telemetry.cpp
-# ──────────────────────────────────────────────
-SHM_NAME = "Local\\SCSTelemetry"
-SHM_SIZE = 32 * 1024  # 32 KB
+try:
+    import truck_telemetry
+    TELEMETRY_AVAILABLE = True
+except Exception:
+    TELEMETRY_AVAILABLE = False
 
-# Offsets (Bytes) – SDK v1.12 / ETS2 1.49+
-OFF_SDK_ACTIVE        = 0       # uint32  – 1 wenn Spiel läuft und Plugin aktiv
-OFF_PAUSED            = 4       # uint32  – 1 wenn Pause
-OFF_SPEED             = 136     # float   – m/s
-OFF_RPM               = 140     # float   – U/min
-OFF_FUEL              = 148     # float   – Liter
-OFF_FUEL_CAPACITY     = 152     # float   – Liter max
-OFF_GEAR              = 196     # int32   – aktueller Gang (neg = Rückwärts)
-OFF_TRUCK_DMG         = 288     # float   – 0.0–1.0 (Gesamtschaden)
-OFF_ENGINE_ON         = 532     # uint32  – Motor an/aus
+# ──────────────────────────────────────────────
+# ETS2 Telemetry (via scs-sdk-plugin / truck-telemetry)
+# Parst das reale SDK-Struct statt fester Byte-Offsets,
+# da sich das Speicherlayout zwischen SDK-Versionen ändert.
+# ──────────────────────────────────────────────
+_telemetry_initialized = False
+
+def _ensure_telemetry_init():
+    global _telemetry_initialized
+    if not TELEMETRY_AVAILABLE:
+        return False
+    if _telemetry_initialized:
+        return True
+    try:
+        truck_telemetry.init()
+        _telemetry_initialized = True
+    except Exception:
+        return False
+    return True
 
 def read_telemetry():
-    """Liest ETS2 Shared Memory aus. Gibt dict zurück oder None wenn nicht verfügbar."""
+    """Liest ETS2 Telemetrie aus. Gibt dict zurück oder None wenn nicht verfügbar."""
+    global _telemetry_initialized
+    if not _ensure_telemetry_init():
+        return None
     try:
-        shm = mmap.mmap(-1, SHM_SIZE, SHM_NAME, access=mmap.ACCESS_READ)
-        def ru32(off): return struct.unpack_from("<I", shm, off)[0]
-        def ri32(off): return struct.unpack_from("<i", shm, off)[0]
-        def rf32(off): return struct.unpack_from("<f", shm, off)[0]
-
-        if ru32(OFF_SDK_ACTIVE) != 1:
-            shm.close()
+        data = truck_telemetry.get_data()
+        if not data.get("sdkActive"):
             return None
 
-        speed_ms   = rf32(OFF_SPEED)
-        rpm        = rf32(OFF_RPM)
-        fuel       = rf32(OFF_FUEL)
-        fuel_cap   = rf32(OFF_FUEL_CAPACITY)
-        gear       = ri32(OFF_GEAR)
-        truck_dmg  = rf32(OFF_TRUCK_DMG)
-        engine_on  = ru32(OFF_ENGINE_ON)
-        paused     = ru32(OFF_PAUSED)
-        shm.close()
-
-        speed_kmh = abs(speed_ms) * 3.6
+        speed_kmh = abs(data["speed"]) * 3.6
+        gear      = data["gear"]
         gear_str  = "R" if gear < 0 else ("N" if gear == 0 else str(gear))
+        fuel      = data["fuel"]
+        fuel_cap  = data["fuelCapacity"]
         fuel_pct  = (fuel / fuel_cap * 100) if fuel_cap > 0 else 0
+        wear_avg  = (data["wearEngine"] + data["wearTransmission"] + data["wearCabin"]
+                     + data["wearChassis"] + data["wearWheels"]) / 5
 
         return {
             "speed":     speed_kmh,
-            "rpm":       rpm,
+            "rpm":       data["engineRpm"],
             "gear":      gear_str,
             "fuel":      fuel,
             "fuel_pct":  fuel_pct,
-            "truck_dmg": truck_dmg * 100,
-            "engine":    engine_on == 1,
-            "paused":    paused == 1,
+            "truck_dmg": wear_avg * 100,
+            "engine":    bool(data["engineEnabled"]),
+            "paused":    bool(data["paused"]),
         }
     except Exception:
+        # Shared Memory evtl. verschwunden (Spiel beendet) -> beim naechsten Mal neu verbinden
+        _telemetry_initialized = False
         return None
 
 
