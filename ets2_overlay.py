@@ -14,7 +14,8 @@ import time
 import psutil
 import csv
 import os
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -70,33 +71,37 @@ def read_telemetry():
         wear_avg  = (data["wearEngine"] + data["wearTransmission"] + data["wearCabin"]
                      + data["wearChassis"] + data["wearWheels"]) / 5
 
-        # Ankunftszeit: routeTime (Sekunden Restfahrzeit) auf time_abs
-        # (aktuelle Spielzeit in Minuten) aufaddieren -> Ankunftsuhrzeit
-        eta_str = "--"
+        # Ankunftszeit (Spielzeit): routeTime (Sekunden Restfahrzeit) auf
+        # time_abs (aktuelle Spielzeit in Minuten) aufaddieren
+        on_job       = bool(data.get("onJob"))
+        remaining_s  = data["routeTime"] if on_job else 0.0
+        eta_game_str = "--"
         remaining_str = "--"
-        if data.get("onJob") and data["routeTime"] > 0:
-            remaining_min = data["routeTime"] / 60.0
+        if on_job and remaining_s > 0:
+            remaining_min = remaining_s / 60.0
             remaining_str = f"{int(remaining_min // 60)}:{int(remaining_min % 60):02d} h"
 
             time_abs = data["time_abs"]
             eta_abs  = time_abs + remaining_min
             day_offset = int(eta_abs // 1440) - int(time_abs // 1440)
             tod = eta_abs % 1440
-            eta_str = f"{int(tod // 60):02d}:{int(tod % 60):02d}"
+            eta_game_str = f"{int(tod // 60):02d}:{int(tod % 60):02d}"
             if day_offset > 0:
-                eta_str += f" +{day_offset}T"
+                eta_game_str += f" +{day_offset}T"
 
         return {
-            "speed":     speed_kmh,
-            "rpm":       data["engineRpm"],
-            "gear":      gear_str,
-            "fuel":      fuel,
-            "fuel_pct":  fuel_pct,
-            "truck_dmg": wear_avg * 100,
-            "engine":    bool(data["engineEnabled"]),
-            "paused":    bool(data["paused"]),
-            "eta":       eta_str,
-            "remaining": remaining_str,
+            "speed":        speed_kmh,
+            "rpm":           data["engineRpm"],
+            "gear":          gear_str,
+            "fuel":          fuel,
+            "fuel_pct":      fuel_pct,
+            "truck_dmg":     wear_avg * 100,
+            "engine":        bool(data["engineEnabled"]),
+            "paused":        bool(data["paused"]),
+            "on_job":        on_job,
+            "remaining_sec": remaining_s,
+            "eta_game":      eta_game_str,
+            "remaining":     remaining_str,
         }
     except Exception:
         # Shared Memory evtl. verschwunden (Spiel beendet) -> beim naechsten Mal neu verbinden
@@ -278,6 +283,10 @@ class ETS2Overlay:
         self._logger     = CSVLogger()
         self._log_rows   = 0
         self._logging_on = True
+        # Rollendes Fenster (Realzeit, Rest-Fahrzeit) zur Schätzung der
+        # tatsächlichen Ankunftszeit, da ETS2 keinen festen Zeitraffer-Faktor
+        # exportiert (variiert Stadt/Autobahn + Mods)
+        self._eta_samples = deque(maxlen=40)  # ~20s bei 500ms Polling
 
         # Background-Threads für Stats
         threading.Thread(target=self._hw_loop,   daemon=True).start()
@@ -345,7 +354,8 @@ class ETS2Overlay:
         self.lbl_rpm        = row(main, "Drehzahl")
         self.lbl_fuel       = row(main, "Kraftstoff")
         self.lbl_dmg        = row(main, "Schaden")
-        self.lbl_eta        = row(main, "Ankunft")
+        self.lbl_eta_real   = row(main, "Ankunft")
+        self.lbl_eta_game   = row(main, "  (Spielzeit)")
         self.lbl_remaining  = row(main, "Restzeit")
 
         # Footer
@@ -371,9 +381,42 @@ class ETS2Overlay:
     def _ets_loop(self):
         while True:
             data = read_telemetry()
+            if data is not None:
+                data["eta_real"] = self._estimate_real_eta(data)
             with self._lock:
                 self._ets_data = data
             time.sleep(self.REFRESH_ETS / 1000)
+
+    def _estimate_real_eta(self, ets):
+        """Schätzt die reale (Wanduhr-)Ankunftszeit aus der beobachteten
+        Abnahmerate von routeTime (Spielsekunden pro Realsekunde), statt
+        eines festen Zeitraffer-Faktors -- der ist in ETS2 nicht konstant."""
+        if not ets["on_job"] or ets["paused"] or not ets["engine"]:
+            return "--"
+
+        remaining_s = ets["remaining_sec"]
+        now = time.monotonic()
+
+        if self._eta_samples:
+            _, last_remaining = self._eta_samples[-1]
+            # Neuer Job / Umleitung -> Verlauf verwerfen
+            if remaining_s > last_remaining + 30:
+                self._eta_samples.clear()
+
+        self._eta_samples.append((now, remaining_s))
+        if len(self._eta_samples) < 2:
+            return "--"
+
+        oldest_t, oldest_remaining = self._eta_samples[0]
+        real_elapsed  = now - oldest_t
+        game_decrease = oldest_remaining - remaining_s
+        if real_elapsed < 3 or game_decrease <= 0:
+            return "--"
+
+        rate = game_decrease / real_elapsed  # Spielsekunden pro Realsekunde
+        real_seconds_left = remaining_s / rate
+        arrival = datetime.now() + timedelta(seconds=real_seconds_left)
+        return arrival.strftime("%H:%M")
 
     def _log_loop(self):
         while True:
@@ -432,7 +475,8 @@ class ETS2Overlay:
         if ets is None:
             self.lbl_ets_status.config(text="Warten...", fg="#888888")
             for lbl in (self.lbl_speed, self.lbl_gear, self.lbl_rpm,
-                        self.lbl_fuel, self.lbl_dmg, self.lbl_eta, self.lbl_remaining):
+                        self.lbl_fuel, self.lbl_dmg, self.lbl_eta_real,
+                        self.lbl_eta_game, self.lbl_remaining):
                 lbl.config(text="--", fg="#888888")
         else:
             status = "⏸ Pause" if ets["paused"] else ("▶ Läuft" if ets["engine"] else "Motor aus")
@@ -446,8 +490,12 @@ class ETS2Overlay:
             self.lbl_dmg.config(
                 text=f"{ets['truck_dmg']:.1f} %",
                 fg=color_dmg(ets["truck_dmg"]))
-            self.lbl_eta.config(text=ets["eta"], fg="#4FC3F7" if ets["eta"] != "--" else "#888888")
-            self.lbl_remaining.config(text=ets["remaining"], fg="#FFFFFF" if ets["remaining"] != "--" else "#888888")
+            self.lbl_eta_real.config(
+                text=ets["eta_real"], fg="#44FF88" if ets["eta_real"] != "--" else "#888888")
+            self.lbl_eta_game.config(
+                text=ets["eta_game"], fg="#4FC3F7" if ets["eta_game"] != "--" else "#888888")
+            self.lbl_remaining.config(
+                text=ets["remaining"], fg="#FFFFFF" if ets["remaining"] != "--" else "#888888")
 
         # Log-Status Footer aktualisieren
         if self._logging_on:
