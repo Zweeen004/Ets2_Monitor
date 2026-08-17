@@ -13,6 +13,7 @@ import threading
 import time
 import psutil
 import csv
+import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -183,6 +184,58 @@ def color_fuel(pct):
 
 
 # ──────────────────────────────────────────────
+# Anzeige-Konfiguration: welche Werte es gibt, und
+# Persistenz für Sichtbarkeit/Losgelöst-Status/Position/Skalierung
+# ──────────────────────────────────────────────
+METRIC_DEFS = [
+    # (id, Sektion, Anzeige-Label)
+    ("cpu_pct",    "CPU",  "Auslastung"),
+    ("cpu_temp",   "CPU",  "Temperatur"),
+    ("gpu_pct",    "GPU",  "Auslastung"),
+    ("gpu_temp",   "GPU",  "Temperatur"),
+    ("vram",       "GPU",  "VRAM"),
+    ("ram",        "RAM",  "Belegung"),
+    ("ets_status", "ETS2", "Status"),
+    ("speed",      "ETS2", "Tempo"),
+    ("gear",       "ETS2", "Gang"),
+    ("rpm",        "ETS2", "Drehzahl"),
+    ("fuel",       "ETS2", "Kraftstoff"),
+    ("dmg",        "ETS2", "Schaden"),
+    ("eta_real",   "ETS2", "Ankunft"),
+    ("eta_game",   "ETS2", "  (Spielzeit)"),
+    ("remaining",  "ETS2", "Restzeit"),
+]
+
+SETTINGS_PATH = Path.home() / ".ets2_monitor_settings.json"
+
+def _default_metric_settings():
+    return {"visible": True, "detached": False, "x": None, "y": None, "scale": 1.0}
+
+def load_settings():
+    settings = {
+        "main_window": {"x": 10, "y": 10},
+        "metrics": {mid: _default_metric_settings() for mid, _, _ in METRIC_DEFS},
+    }
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        settings["main_window"].update(saved.get("main_window", {}))
+        for mid, cfg in saved.get("metrics", {}).items():
+            if mid in settings["metrics"]:
+                settings["metrics"][mid].update(cfg)
+    except Exception:
+        pass
+    return settings
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────
 # CSV Logger
 # ──────────────────────────────────────────────
 LOG_INTERVAL_SEC = 5   # Alle N Sekunden einen Datensatz schreiben
@@ -243,6 +296,146 @@ class CSVLogger:
 
 
 # ──────────────────────────────────────────────
+# Losgelöstes Einzel-Widget (frei positionierbar/skalierbar)
+# ──────────────────────────────────────────────
+class DetachedWidget(tk.Toplevel):
+    BG_COLOR = "#0D0D0D"
+
+    def __init__(self, master, metric_id, label_text, settings, on_change):
+        super().__init__(master)
+        self.metric_id = metric_id
+        self.settings  = settings
+        self.on_change = on_change
+
+        self.overrideredirect(True)
+        self.wm_attributes("-topmost", True)
+        self.configure(bg=self.BG_COLOR)
+
+        cfg = settings["metrics"][metric_id]
+        x = cfg["x"] if cfg["x"] is not None else 300
+        y = cfg["y"] if cfg["y"] is not None else 300
+        self.geometry(f"+{x}+{y}")
+        self.scale = cfg.get("scale", 1.0)
+
+        frame = tk.Frame(self, bg=self.BG_COLOR, highlightbackground="#4FC3F7", highlightthickness=1)
+        frame.pack()
+        self._lbl_title = tk.Label(frame, text=label_text.strip(), bg=self.BG_COLOR, fg="#4FC3F7")
+        self._lbl_title.pack(anchor=tk.W, padx=5, pady=(3, 0))
+        self._lbl_value = tk.Label(frame, text="--", bg=self.BG_COLOR, fg="#CCCCCC")
+        self._lbl_value.pack(padx=7, pady=(0, 5))
+        self._apply_scale()
+
+        for w in (self, frame, self._lbl_title, self._lbl_value):
+            w.bind("<ButtonPress-1>",   self._drag_start)
+            w.bind("<B1-Motion>",       self._drag_motion)
+            w.bind("<ButtonRelease-1>", self._drag_end)
+            w.bind("<MouseWheel>",      self._on_scroll)
+            w.bind("<ButtonPress-3>",   self._show_menu)
+        self._drag_x = self._drag_y = 0
+
+    def _apply_scale(self):
+        self._lbl_title.config(font=("Consolas", max(6, round(7 * self.scale))))
+        self._lbl_value.config(font=("Consolas", max(8, round(15 * self.scale)), "bold"))
+
+    def set_value(self, text, color):
+        self._lbl_value.config(text=text, fg=color)
+
+    def _drag_start(self, event):
+        self._drag_x, self._drag_y = event.x, event.y
+
+    def _drag_motion(self, event):
+        x = self.winfo_x() + (event.x - self._drag_x)
+        y = self.winfo_y() + (event.y - self._drag_y)
+        self.geometry(f"+{x}+{y}")
+
+    def _drag_end(self, event):
+        cfg = self.settings["metrics"][self.metric_id]
+        cfg["x"], cfg["y"] = self.winfo_x(), self.winfo_y()
+        self.on_change()
+
+    def _on_scroll(self, event):
+        factor = 1.1 if event.delta > 0 else (1 / 1.1)
+        self.scale = min(max(self.scale * factor, 0.5), 3.0)
+        self._apply_scale()
+        self.settings["metrics"][self.metric_id]["scale"] = self.scale
+        self.on_change()
+
+    def _show_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, bg="#1A1A2E", fg="#CCCCCC",
+                        activebackground="#4FC3F7", activeforeground="#000000")
+        menu.add_command(label="Anheften (zurück ins Panel)", command=self._dock_back)
+        menu.add_command(label="Ausblenden", command=self._hide)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _dock_back(self):
+        self.settings["metrics"][self.metric_id]["detached"] = False
+        self.on_change(relayout=True)
+
+    def _hide(self):
+        self.settings["metrics"][self.metric_id]["visible"] = False
+        self.on_change(relayout=True)
+
+
+# ──────────────────────────────────────────────
+# Einstellungsfenster: Sichtbarkeit / Losgelöst pro Wert
+# ──────────────────────────────────────────────
+class SettingsWindow(tk.Toplevel):
+    def __init__(self, master, settings, on_change):
+        super().__init__(master)
+        self.settings  = settings
+        self.on_change = on_change
+        self.title("ETS2 Monitor – Anzeige anpassen")
+        self.configure(bg="#0D0D0D")
+        self.attributes("-topmost", True)
+
+        tk.Label(self, text="Sichtbar / Losgelöst pro Wert", font=("Consolas", 9, "bold"),
+                 fg="#4FC3F7", bg="#0D0D0D").pack(padx=8, pady=(8, 4), anchor=tk.W)
+
+        container = tk.Frame(self, bg="#0D0D0D")
+        container.pack(padx=8, pady=4)
+
+        self._vis_vars = {}
+        self._det_vars = {}
+        last_section = None
+        for mid, sect, label in METRIC_DEFS:
+            r = container.grid_size()[1]
+            if sect != last_section:
+                tk.Label(container, text=sect, font=("Consolas", 8, "bold"), fg="#666666",
+                         bg="#0D0D0D").grid(row=r, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+                last_section = sect
+                r += 1
+
+            cfg = self.settings["metrics"][mid]
+            tk.Label(container, text=label.strip(), font=("Consolas", 8), fg="#CCCCCC",
+                     bg="#0D0D0D", width=14, anchor=tk.W).grid(row=r, column=0, sticky=tk.W)
+
+            vis_var = tk.BooleanVar(value=cfg["visible"])
+            det_var = tk.BooleanVar(value=cfg["detached"])
+            self._vis_vars[mid] = vis_var
+            self._det_vars[mid] = det_var
+
+            tk.Checkbutton(container, text="Sichtbar", variable=vis_var, bg="#0D0D0D", fg="#CCCCCC",
+                            selectcolor="#1A1A2E", activebackground="#0D0D0D",
+                            command=lambda m=mid: self._on_toggle(m)).grid(row=r, column=1, sticky=tk.W, padx=4)
+            tk.Checkbutton(container, text="Losgelöst", variable=det_var, bg="#0D0D0D", fg="#CCCCCC",
+                            selectcolor="#1A1A2E", activebackground="#0D0D0D",
+                            command=lambda m=mid: self._on_toggle(m)).grid(row=r, column=2, sticky=tk.W, padx=4)
+
+        tk.Label(self, text="Losgelöste Widgets: Ziehen zum Verschieben, Mausrad zum\n"
+                             "Skalieren, Rechtsklick zum Anheften/Ausblenden.",
+                 font=("Consolas", 7), fg="#666666", bg="#0D0D0D", justify=tk.LEFT
+                 ).pack(padx=8, pady=(4, 8), anchor=tk.W)
+
+        tk.Button(self, text="Schließen", command=self.destroy).pack(pady=(0, 8))
+
+    def _on_toggle(self, mid):
+        cfg = self.settings["metrics"][mid]
+        cfg["visible"]  = self._vis_vars[mid].get()
+        cfg["detached"] = self._det_vars[mid].get()
+        self.on_change(relayout=True)
+
+
+# ──────────────────────────────────────────────
 # Overlay Window
 # ──────────────────────────────────────────────
 class ETS2Overlay:
@@ -259,23 +452,31 @@ class ETS2Overlay:
 
     def __init__(self, root):
         self.root = root
+        self.settings = load_settings()
+
         self.root.title("ETS2 Monitor")
         self.root.overrideredirect(True)           # kein Fensterrahmen
         self.root.wm_attributes("-topmost", True)  # immer oben
         self.root.wm_attributes("-alpha", self.ALPHA)
         self.root.configure(bg=self.BG_COLOR)
-        self.root.geometry(f"+10+10")             # Oben links
+        mw = self.settings["main_window"]
+        self.root.geometry(f"+{mw.get('x', 10)}+{mw.get('y', 10)}")
 
         # Drag-Support
         self.root.bind("<ButtonPress-1>",   self._drag_start)
         self.root.bind("<B1-Motion>",       self._drag_motion)
+        self.root.bind("<ButtonRelease-1>", self._drag_end)
         self.root.bind("<ButtonPress-3>",   self._show_menu)
         self._drag_x = self._drag_y = 0
 
         # Doppelklick zum Schließen
-        self.root.bind("<Double-Button-1>", lambda e: self.root.destroy())
+        self.root.bind("<Double-Button-1>", lambda e: self._close_app())
 
+        self._detached      = {}   # metric_id -> DetachedWidget
+        self._value_labels  = {}   # metric_id -> Label (nur wenn inline im Panel)
         self._build_ui()
+        self._sync_detached_widgets()
+
         self._hw_stats   = {}
         self._ets_data   = None
         self._lock       = threading.Lock()
@@ -317,10 +518,9 @@ class ETS2Overlay:
             f.pack(fill=tk.X, pady=(4, 0))
             tk.Label(f, text=f"── {text} ──", font=self.FONT_TITLE,
                      fg="#4FC3F7", bg=self.BG_COLOR).pack(anchor=tk.W)
-            return f
 
-        def row(parent, label):
-            f = tk.Frame(parent, bg=self.BG_COLOR)
+        def row(label):
+            f = tk.Frame(main, bg=self.BG_COLOR)
             f.pack(fill=tk.X)
             tk.Label(f, text=f"{label:<12}", font=self.FONT_MONO,
                      fg=self.LABEL_COLOR, bg=self.BG_COLOR, width=12, anchor=tk.W).pack(side=tk.LEFT)
@@ -329,42 +529,54 @@ class ETS2Overlay:
             val.pack(side=tk.LEFT)
             return val
 
-        # ── CPU ──
-        section("CPU")
-        self.lbl_cpu_pct  = row(main, "Auslastung")
-        self.lbl_cpu_temp = row(main, "Temperatur")
-
-        # ── GPU ──
-        section("GPU")
-        self.lbl_gpu_pct  = row(main, "Auslastung")
-        self.lbl_gpu_temp = row(main, "Temperatur")
-        self.lbl_vram     = row(main, "VRAM")
-
-        # ── RAM ──
-        section("RAM")
-        self.lbl_ram      = row(main, "Belegung")
-
-        # ── ETS2 ──
-        section("ETS2")
-        self.lbl_ets_status = row(main, "Status")
-        self.lbl_speed      = row(main, "Tempo")
-        self.lbl_gear       = row(main, "Gang")
-        self.lbl_rpm        = row(main, "Drehzahl")
-        self.lbl_fuel       = row(main, "Kraftstoff")
-        self.lbl_dmg        = row(main, "Schaden")
-        self.lbl_eta_real   = row(main, "Ankunft")
-        self.lbl_eta_game   = row(main, "  (Spielzeit)")
-        self.lbl_remaining  = row(main, "Restzeit")
+        # Nur Werte anzeigen, die sichtbar und NICHT losgelöst sind;
+        # Sektionsüberschrift nur, wenn darin mindestens eine Zeile folgt
+        self._value_labels = {}
+        last_section = None
+        for mid, sect, label in METRIC_DEFS:
+            cfg = self.settings["metrics"][mid]
+            if not cfg["visible"] or cfg["detached"]:
+                continue
+            if sect != last_section:
+                section(sect)
+                last_section = sect
+            self._value_labels[mid] = row(label)
 
         # Footer
         tk.Frame(self.root, bg="#222233", height=1).pack(fill=tk.X, pady=(4, 0))
         footer = tk.Frame(self.root, bg=self.BG_COLOR)
         footer.pack(fill=tk.X, padx=4, pady=2)
-        tk.Label(footer, text="ETS2 Monitor v1.1", font=("Consolas", 7),
+        tk.Label(footer, text="ETS2 Monitor v1.6.1-beta", font=("Consolas", 7),
                  fg="#333344", bg=self.BG_COLOR).pack(side=tk.LEFT)
         self.lbl_log_status = tk.Label(footer, text="● LOG", font=("Consolas", 7),
                                        fg="#44FF88", bg=self.BG_COLOR)
         self.lbl_log_status.pack(side=tk.RIGHT)
+
+    def _rebuild_layout(self):
+        for child in self.root.winfo_children():
+            child.destroy()
+        self._build_ui()
+        self._sync_detached_widgets()
+
+    def _sync_detached_widgets(self):
+        for mid, sect, label in METRIC_DEFS:
+            cfg = self.settings["metrics"][mid]
+            want_detached = cfg["visible"] and cfg["detached"]
+            have = mid in self._detached
+            if want_detached and not have:
+                self._detached[mid] = DetachedWidget(
+                    self.root, mid, label, self.settings, self._on_widget_change)
+            elif not want_detached and have:
+                self._detached[mid].destroy()
+                del self._detached[mid]
+
+    def _on_widget_change(self, relayout=False):
+        save_settings(self.settings)
+        if relayout:
+            self._rebuild_layout()
+
+    def _open_settings_window(self):
+        SettingsWindow(self.root, self.settings, self._on_widget_change)
 
     # ── Background Threads ────────────────────
     def _hw_loop(self):
@@ -451,69 +663,63 @@ class ETS2Overlay:
                 pass
 
     # ── UI Update (Main Thread) ───────────────
+    def _compute_values(self, hw, ets):
+        """Berechnet (Text, Farbe) für jeden bekannten Messwert -- unabhängig
+        davon, ob er gerade inline im Panel oder als losgelöstes Widget
+        angezeigt wird (oder auch gar nicht sichtbar ist)."""
+        values = {}
+
+        cpu_pct = hw.get("cpu_pct")
+        cpu_tmp = hw.get("cpu_temp")
+        values["cpu_pct"]  = (f"{cpu_pct:.0f} %" if cpu_pct is not None else "--", color_pct(cpu_pct))
+        values["cpu_temp"] = (f"{cpu_tmp:.0f} °C" if cpu_tmp is not None else "n/a (WMI)", color_temp(cpu_tmp))
+
+        gpu_pct = hw.get("gpu_pct")
+        gpu_tmp = hw.get("gpu_temp")
+        vram_u  = hw.get("vram_used")
+        vram_t  = hw.get("vram_total")
+        values["gpu_pct"]  = (f"{gpu_pct} %" if gpu_pct is not None else "--", color_pct(gpu_pct))
+        values["gpu_temp"] = (f"{gpu_tmp} °C" if gpu_tmp is not None else "--", color_temp(gpu_tmp))
+        values["vram"]     = (f"{vram_u:.1f} / {vram_t:.0f} GB" if vram_u is not None else "--",
+                               color_pct((vram_u / vram_t * 100) if vram_t else None, warn=75, crit=90))
+
+        ram_u = hw.get("ram_used_gb")
+        ram_t = hw.get("ram_total_gb")
+        ram_p = hw.get("ram_pct")
+        values["ram"] = (f"{ram_u:.1f} / {ram_t:.0f} GB ({ram_p:.0f}%)" if ram_u else "--", color_pct(ram_p))
+
+        if ets is None:
+            values["ets_status"] = ("Warten...", "#888888")
+            for mid in ("speed", "gear", "rpm", "fuel", "dmg", "eta_real", "eta_game", "remaining"):
+                values[mid] = ("--", "#888888")
+        else:
+            status = "⏸ Pause" if ets["paused"] else ("▶ Läuft" if ets["engine"] else "Motor aus")
+            values["ets_status"] = (status, "#44FF88" if not ets["paused"] else "#FFAA00")
+            values["speed"]      = (f"{ets['speed']:.0f} km/h", "#FFFFFF")
+            values["gear"]       = (ets["gear"], "#4FC3F7")
+            values["rpm"]        = (f"{ets['rpm']:.0f}", "#FFFFFF")
+            values["fuel"]       = (f"{ets['fuel']:.0f} L ({ets['fuel_pct']:.0f}%)",
+                                     color_fuel(ets["fuel_pct"]))
+            values["dmg"]        = (f"{ets['truck_dmg']:.1f} %", color_dmg(ets["truck_dmg"]))
+            values["eta_real"]   = (ets["eta_real"], "#44FF88" if ets["eta_real"] != "--" else "#888888")
+            values["eta_game"]   = (ets["eta_game"], "#4FC3F7" if ets["eta_game"] != "--" else "#888888")
+            values["remaining"]  = (ets["remaining"], "#FFFFFF" if ets["remaining"] != "--" else "#888888")
+
+        return values
+
     def _update_ui(self):
         with self._lock:
             hw  = self._hw_stats.copy()
             ets = self._ets_data
 
-        # CPU
-        cpu_pct = hw.get("cpu_pct")
-        cpu_tmp = hw.get("cpu_temp")
-        self.lbl_cpu_pct.config(
-            text=f"{cpu_pct:.0f} %" if cpu_pct is not None else "--",
-            fg=color_pct(cpu_pct))
-        self.lbl_cpu_temp.config(
-            text=f"{cpu_tmp:.0f} °C" if cpu_tmp is not None else "n/a (WMI)",
-            fg=color_temp(cpu_tmp))
-
-        # GPU
-        gpu_pct  = hw.get("gpu_pct")
-        gpu_tmp  = hw.get("gpu_temp")
-        vram_u   = hw.get("vram_used")
-        vram_t   = hw.get("vram_total")
-        self.lbl_gpu_pct.config(
-            text=f"{gpu_pct} %" if gpu_pct is not None else "--",
-            fg=color_pct(gpu_pct))
-        self.lbl_gpu_temp.config(
-            text=f"{gpu_tmp} °C" if gpu_tmp is not None else "--",
-            fg=color_temp(gpu_tmp))
-        self.lbl_vram.config(
-            text=f"{vram_u:.1f} / {vram_t:.0f} GB" if vram_u is not None else "--",
-            fg=color_pct((vram_u / vram_t * 100) if vram_t else None, warn=75, crit=90))
-
-        # RAM
-        ram_u = hw.get("ram_used_gb")
-        ram_t = hw.get("ram_total_gb")
-        ram_p = hw.get("ram_pct")
-        self.lbl_ram.config(
-            text=f"{ram_u:.1f} / {ram_t:.0f} GB ({ram_p:.0f}%)" if ram_u else "--",
-            fg=color_pct(ram_p))
-
-        # ETS2
-        if ets is None:
-            self.lbl_ets_status.config(text="Warten...", fg="#888888")
-            for lbl in (self.lbl_speed, self.lbl_gear, self.lbl_rpm,
-                        self.lbl_fuel, self.lbl_dmg, self.lbl_eta_real,
-                        self.lbl_eta_game, self.lbl_remaining):
-                lbl.config(text="--", fg="#888888")
-        else:
-            status = "⏸ Pause" if ets["paused"] else ("▶ Läuft" if ets["engine"] else "Motor aus")
-            self.lbl_ets_status.config(text=status, fg="#44FF88" if not ets["paused"] else "#FFAA00")
-            self.lbl_speed.config(text=f"{ets['speed']:.0f} km/h", fg="#FFFFFF")
-            self.lbl_gear.config(text=ets["gear"], fg="#4FC3F7")
-            self.lbl_rpm.config(text=f"{ets['rpm']:.0f}", fg="#FFFFFF")
-            self.lbl_fuel.config(
-                text=f"{ets['fuel']:.0f} L ({ets['fuel_pct']:.0f}%)",
-                fg=color_fuel(ets["fuel_pct"]))
-            self.lbl_dmg.config(
-                text=f"{ets['truck_dmg']:.1f} %",
-                fg=color_dmg(ets["truck_dmg"]))
-            self.lbl_eta_real.config(
-                text=ets["eta_real"], fg="#44FF88" if ets["eta_real"] != "--" else "#888888")
-            self.lbl_eta_game.config(
-                text=ets["eta_game"], fg="#4FC3F7" if ets["eta_game"] != "--" else "#888888")
-            self.lbl_remaining.config(
-                text=ets["remaining"], fg="#FFFFFF" if ets["remaining"] != "--" else "#888888")
+        values = self._compute_values(hw, ets)
+        for mid, (text, color) in values.items():
+            lbl = self._value_labels.get(mid)
+            if lbl is not None:
+                lbl.config(text=text, fg=color)
+            widget = self._detached.get(mid)
+            if widget is not None:
+                widget.set_value(text, color)
 
         # Log-Status Footer aktualisieren
         if self._logging_on:
@@ -535,6 +741,11 @@ class ETS2Overlay:
         y = self.root.winfo_y() + (event.y - self._drag_y)
         self.root.geometry(f"+{x}+{y}")
 
+    def _drag_end(self, event):
+        self.settings["main_window"]["x"] = self.root.winfo_x()
+        self.settings["main_window"]["y"] = self.root.winfo_y()
+        save_settings(self.settings)
+
     # ── Rechtsklick-Menü ─────────────────────
     def _show_menu(self, event):
         menu = tk.Menu(self.root, tearoff=0, bg="#1A1A2E", fg="#CCCCCC",
@@ -543,16 +754,22 @@ class ETS2Overlay:
         menu.add_command(label="Transparenz: 75%",  command=lambda: self.root.wm_attributes("-alpha", 0.75))
         menu.add_command(label="Transparenz: 90%",  command=lambda: self.root.wm_attributes("-alpha", 0.9))
         menu.add_separator()
+        menu.add_command(label="Anzeige anpassen...", command=self._open_settings_window)
+        menu.add_separator()
         log_label = "Logging PAUSIEREN" if self._logging_on else "Logging STARTEN"
         menu.add_command(label=log_label, command=self._toggle_logging)
         menu.add_command(label=f"Log öffnen ({self._logger.filename})",
                          command=lambda: os.startfile(str(self._logger.path)))
         menu.add_separator()
-        menu.add_command(label="Schließen", command=self.root.destroy)
+        menu.add_command(label="Schließen", command=self._close_app)
         menu.tk_popup(event.x_root, event.y_root)
 
     def _toggle_logging(self):
         self._logging_on = not self._logging_on
+
+    def _close_app(self):
+        save_settings(self.settings)
+        self.root.destroy()
 
 
 # ──────────────────────────────────────────────
