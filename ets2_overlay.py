@@ -89,18 +89,19 @@ def read_telemetry():
                 eta_game_str += f" +{day_offset}T"
 
         return {
-            "speed":        speed_kmh,
-            "rpm":           data["engineRpm"],
-            "gear":          gear_str,
-            "fuel":          fuel,
-            "fuel_pct":      fuel_pct,
-            "truck_dmg":     wear_avg * 100,
-            "engine":        bool(data["engineEnabled"]),
-            "paused":        bool(data["paused"]),
-            "on_job":        on_job,
-            "remaining_sec": remaining_s,
-            "eta_game":      eta_game_str,
-            "remaining":     remaining_str,
+            "speed":             speed_kmh,
+            "rpm":               data["engineRpm"],
+            "gear":              gear_str,
+            "fuel":              fuel,
+            "fuel_pct":          fuel_pct,
+            "truck_dmg":         wear_avg * 100,
+            "engine":            bool(data["engineEnabled"]),
+            "paused":            bool(data["paused"]),
+            "on_job":            on_job,
+            "remaining_sec":     remaining_s,
+            "route_distance_km": data["routeDistance"] if on_job else 0.0,
+            "eta_game":          eta_game_str,
+            "remaining":         remaining_str,
         }
     except Exception:
         # Shared Memory evtl. verschwunden (Spiel beendet) -> beim naechsten Mal neu verbinden
@@ -282,11 +283,9 @@ class ETS2Overlay:
         self._logger     = CSVLogger()
         self._log_rows   = 0
         self._logging_on = True
-        # EMA-Zustand zur Schätzung der tatsächlichen Ankunftszeit, da ETS2
-        # keinen festen Zeitraffer-Faktor exportiert (variiert Stadt/Autobahn)
-        self._eta_rate_ema     = None
-        self._eta_last_sample  = None
-        self._eta_sample_count = 0
+        # Geglättete Geschwindigkeit für die reale Ankunftszeitschätzung
+        # (Restdistanz ÷ Tempo -- wie ein normales Fahrzeug-Navi)
+        self._eta_speed_ema = None
 
         # Background-Threads für Stats
         threading.Thread(target=self._hw_loop,   daemon=True).start()
@@ -387,53 +386,35 @@ class ETS2Overlay:
                 self._ets_data = data
             time.sleep(self.REFRESH_ETS / 1000)
 
-    ETA_RATE_EMA_ALPHA  = 0.05  # Glättung ~15-20s Einschwingzeit bei 500ms Polling
-    ETA_MIN_SAMPLES     = 4     # so viele geglättete Messungen, bevor Anzeige startet
+    ETA_SPEED_EMA_ALPHA = 0.15  # leichte Glättung gegen kurze Bremsvorgänge/Ampeln
+    ETA_MIN_SPEED_KMH   = 3     # darunter gilt der Truck als stehend
 
     def _estimate_real_eta(self, ets):
-        """Schätzt die reale (Wanduhr-)Ankunftszeit über einen exponentiell
-        geglätteten Mittelwert der Abnahmerate von routeTime (Spielsekunden
-        pro Realsekunde). ETS2 exportiert keinen festen Zeitraffer-Faktor --
-        die Rate unterscheidet sich zwischen Stadt und Autobahn -- deshalb
-        wird sie laufend gemessen statt einer Konstante angenommen. Die
-        EMA-Glättung verhindert, dass die Anzeige bei jeder Messung springt."""
+        """Schätzt die reale (Wanduhr-)Ankunftszeit direkt aus Restdistanz
+        (routeDistance, vom Navi bereits vorgegeben) und aktueller
+        Geschwindigkeit -- genau wie ein normales Fahrzeug-Navi rechnet.
+        Dadurch sofort verfügbar, ohne erst eine Zeitraffer-Rate lernen zu
+        müssen. Bei Stillstand (Ampel, Stau) bleibt der letzte Wert stehen,
+        statt auf '--' zurückzufallen."""
         if not ets["on_job"]:
-            self._eta_rate_ema     = None
-            self._eta_last_sample  = None
-            self._eta_sample_count = 0
+            self._eta_speed_ema = None
             return "--"
 
-        remaining_s = ets["remaining_sec"]
-        now = time.monotonic()
+        speed_kmh   = ets["speed"]
+        distance_km = ets["route_distance_km"]
 
-        if ets["paused"] or not ets["engine"]:
-            # Fahrt unterbrochen -> Messung pausieren, letzten Trend behalten
-            self._eta_last_sample = None
-        else:
-            if self._eta_last_sample is not None:
-                last_t, last_remaining = self._eta_last_sample
-                dt          = now - last_t
-                d_remaining = last_remaining - remaining_s
+        if speed_kmh >= self.ETA_MIN_SPEED_KMH:
+            if self._eta_speed_ema is None:
+                self._eta_speed_ema = speed_kmh
+            else:
+                self._eta_speed_ema = (self.ETA_SPEED_EMA_ALPHA * speed_kmh
+                    + (1 - self.ETA_SPEED_EMA_ALPHA) * self._eta_speed_ema)
 
-                if remaining_s > last_remaining + 30:
-                    # Neuer Job / Umleitung -> Messung neu starten
-                    self._eta_rate_ema     = None
-                    self._eta_sample_count = 0
-                elif dt > 0 and d_remaining > 0:
-                    instant_rate = d_remaining / dt
-                    if self._eta_rate_ema is None:
-                        self._eta_rate_ema = instant_rate
-                    else:
-                        self._eta_rate_ema = (self.ETA_RATE_EMA_ALPHA * instant_rate
-                            + (1 - self.ETA_RATE_EMA_ALPHA) * self._eta_rate_ema)
-                    self._eta_sample_count += 1
-            self._eta_last_sample = (now, remaining_s)
-
-        if not self._eta_rate_ema or self._eta_sample_count < self.ETA_MIN_SAMPLES:
+        if not self._eta_speed_ema or distance_km <= 0:
             return "--"
 
-        real_seconds_left = remaining_s / self._eta_rate_ema
-        arrival = datetime.now() + timedelta(seconds=real_seconds_left + 30)
+        hours_left = distance_km / self._eta_speed_ema
+        arrival = datetime.now() + timedelta(hours=hours_left, seconds=30)
         arrival = arrival.replace(second=0, microsecond=0)  # auf Minute runden
         return arrival.strftime("%H:%M")
 
