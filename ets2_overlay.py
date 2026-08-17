@@ -14,7 +14,6 @@ import time
 import psutil
 import csv
 import os
-from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -283,10 +282,11 @@ class ETS2Overlay:
         self._logger     = CSVLogger()
         self._log_rows   = 0
         self._logging_on = True
-        # Rollendes Fenster (Realzeit, Rest-Fahrzeit) zur Schätzung der
-        # tatsächlichen Ankunftszeit, da ETS2 keinen festen Zeitraffer-Faktor
-        # exportiert (variiert Stadt/Autobahn + Mods)
-        self._eta_samples = deque(maxlen=40)  # ~20s bei 500ms Polling
+        # EMA-Zustand zur Schätzung der tatsächlichen Ankunftszeit, da ETS2
+        # keinen festen Zeitraffer-Faktor exportiert (variiert Stadt/Autobahn)
+        self._eta_rate_ema     = None
+        self._eta_last_sample  = None
+        self._eta_sample_count = 0
 
         # Background-Threads für Stats
         threading.Thread(target=self._hw_loop,   daemon=True).start()
@@ -387,35 +387,54 @@ class ETS2Overlay:
                 self._ets_data = data
             time.sleep(self.REFRESH_ETS / 1000)
 
+    ETA_RATE_EMA_ALPHA  = 0.05  # Glättung ~15-20s Einschwingzeit bei 500ms Polling
+    ETA_MIN_SAMPLES     = 4     # so viele geglättete Messungen, bevor Anzeige startet
+
     def _estimate_real_eta(self, ets):
-        """Schätzt die reale (Wanduhr-)Ankunftszeit aus der beobachteten
-        Abnahmerate von routeTime (Spielsekunden pro Realsekunde), statt
-        eines festen Zeitraffer-Faktors -- der ist in ETS2 nicht konstant."""
-        if not ets["on_job"] or ets["paused"] or not ets["engine"]:
+        """Schätzt die reale (Wanduhr-)Ankunftszeit über einen exponentiell
+        geglätteten Mittelwert der Abnahmerate von routeTime (Spielsekunden
+        pro Realsekunde). ETS2 exportiert keinen festen Zeitraffer-Faktor --
+        die Rate unterscheidet sich zwischen Stadt und Autobahn -- deshalb
+        wird sie laufend gemessen statt einer Konstante angenommen. Die
+        EMA-Glättung verhindert, dass die Anzeige bei jeder Messung springt."""
+        if not ets["on_job"]:
+            self._eta_rate_ema     = None
+            self._eta_last_sample  = None
+            self._eta_sample_count = 0
             return "--"
 
         remaining_s = ets["remaining_sec"]
         now = time.monotonic()
 
-        if self._eta_samples:
-            _, last_remaining = self._eta_samples[-1]
-            # Neuer Job / Umleitung -> Verlauf verwerfen
-            if remaining_s > last_remaining + 30:
-                self._eta_samples.clear()
+        if ets["paused"] or not ets["engine"]:
+            # Fahrt unterbrochen -> Messung pausieren, letzten Trend behalten
+            self._eta_last_sample = None
+        else:
+            if self._eta_last_sample is not None:
+                last_t, last_remaining = self._eta_last_sample
+                dt          = now - last_t
+                d_remaining = last_remaining - remaining_s
 
-        self._eta_samples.append((now, remaining_s))
-        if len(self._eta_samples) < 2:
+                if remaining_s > last_remaining + 30:
+                    # Neuer Job / Umleitung -> Messung neu starten
+                    self._eta_rate_ema     = None
+                    self._eta_sample_count = 0
+                elif dt > 0 and d_remaining > 0:
+                    instant_rate = d_remaining / dt
+                    if self._eta_rate_ema is None:
+                        self._eta_rate_ema = instant_rate
+                    else:
+                        self._eta_rate_ema = (self.ETA_RATE_EMA_ALPHA * instant_rate
+                            + (1 - self.ETA_RATE_EMA_ALPHA) * self._eta_rate_ema)
+                    self._eta_sample_count += 1
+            self._eta_last_sample = (now, remaining_s)
+
+        if not self._eta_rate_ema or self._eta_sample_count < self.ETA_MIN_SAMPLES:
             return "--"
 
-        oldest_t, oldest_remaining = self._eta_samples[0]
-        real_elapsed  = now - oldest_t
-        game_decrease = oldest_remaining - remaining_s
-        if real_elapsed < 3 or game_decrease <= 0:
-            return "--"
-
-        rate = game_decrease / real_elapsed  # Spielsekunden pro Realsekunde
-        real_seconds_left = remaining_s / rate
-        arrival = datetime.now() + timedelta(seconds=real_seconds_left)
+        real_seconds_left = remaining_s / self._eta_rate_ema
+        arrival = datetime.now() + timedelta(seconds=real_seconds_left + 30)
+        arrival = arrival.replace(second=0, microsecond=0)  # auf Minute runden
         return arrival.strftime("%H:%M")
 
     def _log_loop(self):
