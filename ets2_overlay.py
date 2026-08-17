@@ -99,7 +99,6 @@ def read_telemetry():
             "paused":            bool(data["paused"]),
             "on_job":            on_job,
             "remaining_sec":     remaining_s,
-            "route_distance_km": data["routeDistance"] if on_job else 0.0,
             "eta_game":          eta_game_str,
             "remaining":         remaining_str,
         }
@@ -283,9 +282,9 @@ class ETS2Overlay:
         self._logger     = CSVLogger()
         self._log_rows   = 0
         self._logging_on = True
-        # Geglättete Geschwindigkeit für die reale Ankunftszeitschätzung
-        # (Restdistanz ÷ Tempo -- wie ein normales Fahrzeug-Navi)
-        self._eta_speed_ema = None
+        # EMA-Zustand zur Schätzung der tatsächlichen Ankunftszeit
+        self._eta_rate_ema    = None
+        self._eta_last_sample = None
 
         # Background-Threads für Stats
         threading.Thread(target=self._hw_loop,   daemon=True).start()
@@ -386,35 +385,54 @@ class ETS2Overlay:
                 self._ets_data = data
             time.sleep(self.REFRESH_ETS / 1000)
 
-    ETA_SPEED_EMA_ALPHA = 0.15  # leichte Glättung gegen kurze Bremsvorgänge/Ampeln
-    ETA_MIN_SPEED_KMH   = 3     # darunter gilt der Truck als stehend
+    ETA_RATE_EMA_ALPHA = 0.10  # Anpassgeschwindigkeit an Zonenwechsel Stadt/Autobahn
+    ETA_RATE_DEFAULT   = 15.0  # Startwert bis zur ersten Messung (Mix aus 3x Stadt/19x Autobahn)
+    ETA_RATE_MIN       = 2.0   # Plausibilitätsgrenzen gegen Messrauschen
+    ETA_RATE_MAX       = 25.0
 
     def _estimate_real_eta(self, ets):
-        """Schätzt die reale (Wanduhr-)Ankunftszeit direkt aus Restdistanz
-        (routeDistance, vom Navi bereits vorgegeben) und aktueller
-        Geschwindigkeit -- genau wie ein normales Fahrzeug-Navi rechnet.
-        Dadurch sofort verfügbar, ohne erst eine Zeitraffer-Rate lernen zu
-        müssen. Bei Stillstand (Ampel, Stau) bleibt der letzte Wert stehen,
-        statt auf '--' zurückzufallen."""
+        """Schätzt die reale (Wanduhr-)Ankunftszeit aus routeTime -- ETS2s
+        eigenem Navi-Wert, der die GESAMTE Reststrecke bereits Stadt-/
+        Autobahn-gewichtet berücksichtigt (verifiziert: time_abs + routeTime
+        ergibt exakt die im Spiel angezeigte Navi-Ankunftszeit). Offizielle
+        SCS-Zeitraffer-Werte: ca. 19x außerorts, nur ca. 3x innerorts --
+        eine feste Konstante wäre also falsch, sobald eine Stadt auf der
+        Strecke liegt. Die tatsächliche Rate wird deshalb live gemessen,
+        aber mit einem Startwert vorbelegt, damit sofort etwas angezeigt
+        wird, statt erst zu 'lernen'."""
         if not ets["on_job"]:
-            self._eta_speed_ema = None
+            self._eta_rate_ema    = None
+            self._eta_last_sample = None
             return "--"
 
-        speed_kmh   = ets["speed"]
-        distance_km = ets["route_distance_km"]
-
-        if speed_kmh >= self.ETA_MIN_SPEED_KMH:
-            if self._eta_speed_ema is None:
-                self._eta_speed_ema = speed_kmh
-            else:
-                self._eta_speed_ema = (self.ETA_SPEED_EMA_ALPHA * speed_kmh
-                    + (1 - self.ETA_SPEED_EMA_ALPHA) * self._eta_speed_ema)
-
-        if not self._eta_speed_ema or distance_km <= 0:
+        remaining_s = ets["remaining_sec"]
+        if remaining_s <= 0:
             return "--"
 
-        hours_left = distance_km / self._eta_speed_ema
-        arrival = datetime.now() + timedelta(hours=hours_left, seconds=30)
+        now = time.monotonic()
+        if self._eta_rate_ema is None:
+            self._eta_rate_ema = self.ETA_RATE_DEFAULT
+
+        if ets["paused"] or not ets["engine"]:
+            self._eta_last_sample = None
+        else:
+            if self._eta_last_sample is not None:
+                last_t, last_remaining = self._eta_last_sample
+                dt          = now - last_t
+                d_remaining = last_remaining - remaining_s
+
+                if remaining_s > last_remaining + 30:
+                    # Neuer Job / Umleitung -> Startwert statt verzerrter Messung
+                    self._eta_rate_ema = self.ETA_RATE_DEFAULT
+                elif dt > 0 and d_remaining > 0:
+                    instant_rate = min(max(d_remaining / dt, self.ETA_RATE_MIN),
+                                        self.ETA_RATE_MAX)
+                    self._eta_rate_ema = (self.ETA_RATE_EMA_ALPHA * instant_rate
+                        + (1 - self.ETA_RATE_EMA_ALPHA) * self._eta_rate_ema)
+            self._eta_last_sample = (now, remaining_s)
+
+        real_seconds_left = remaining_s / self._eta_rate_ema
+        arrival = datetime.now() + timedelta(seconds=real_seconds_left + 30)
         arrival = arrival.replace(second=0, microsecond=0)  # auf Minute runden
         return arrival.strftime("%H:%M")
 
