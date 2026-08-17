@@ -11,10 +11,12 @@ import tkinter as tk
 import ctypes
 import threading
 import time
+import math
 import psutil
 import csv
 import json
 import os
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -102,6 +104,8 @@ def read_telemetry():
             "remaining_sec":     remaining_s,
             "eta_game":          eta_game_str,
             "remaining":         remaining_str,
+            "pos_x":             data["coordinateX"],
+            "pos_z":             data["coordinateZ"],
         }
     except Exception:
         # Shared Memory evtl. verschwunden (Spiel beendet) -> beim naechsten Mal neu verbinden
@@ -215,11 +219,13 @@ def load_settings():
     settings = {
         "main_window": {"x": 10, "y": 10},
         "metrics": {mid: _default_metric_settings() for mid, _, _ in METRIC_DEFS},
+        "trail_widget": {"enabled": False, "x": None, "y": None, "meters_per_px": 4.0},
     }
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             saved = json.load(f)
         settings["main_window"].update(saved.get("main_window", {}))
+        settings["trail_widget"].update(saved.get("trail_widget", {}))
         for mid, cfg in saved.get("metrics", {}).items():
             if mid in settings["metrics"]:
                 settings["metrics"][mid].update(cfg)
@@ -377,6 +383,118 @@ class DetachedWidget(tk.Toplevel):
 
 
 # ──────────────────────────────────────────────
+# Spur-Karte: gefahrene Strecke als Linie + Richtungspfeil,
+# ganz ohne Kartenbild -- rein aus den worldX/worldZ-Positionen
+# der Telemetrie. Nord oben, Zoom per Mausrad.
+# ──────────────────────────────────────────────
+class TrailWidget(tk.Toplevel):
+    BG_COLOR   = "#0D0D0D"
+    LINE_COLOR = "#4FC3F7"
+    NOW_COLOR  = "#44FF88"
+    SIZE       = 220
+
+    def __init__(self, master, settings, on_change):
+        super().__init__(master)
+        self.settings = settings
+        self.on_change = on_change
+
+        self.overrideredirect(True)
+        self.wm_attributes("-topmost", True)
+        self.configure(bg=self.BG_COLOR)
+
+        cfg = settings["trail_widget"]
+        x = cfg["x"] if cfg["x"] is not None else 300
+        y = cfg["y"] if cfg["y"] is not None else 300
+        self.geometry(f"+{x}+{y}")
+        self.meters_per_px = cfg.get("meters_per_px", 4.0)
+
+        frame = tk.Frame(self, bg=self.BG_COLOR, highlightbackground=self.LINE_COLOR, highlightthickness=1)
+        frame.pack()
+        title = tk.Frame(frame, bg="#1A1A2E")
+        title.pack(fill=tk.X)
+        tk.Label(title, text="SPUR", font=("Consolas", 7, "bold"), fg=self.LINE_COLOR,
+                 bg="#1A1A2E").pack(side=tk.LEFT, padx=4)
+        self._lbl_scale = tk.Label(title, text="", font=("Consolas", 7), fg="#666666", bg="#1A1A2E")
+        self._lbl_scale.pack(side=tk.RIGHT, padx=4)
+
+        self.canvas = tk.Canvas(frame, width=self.SIZE, height=self.SIZE,
+                                 bg=self.BG_COLOR, highlightthickness=0)
+        self.canvas.pack()
+
+        for w in (self, frame, title, self.canvas):
+            w.bind("<ButtonPress-1>",   self._drag_start)
+            w.bind("<B1-Motion>",       self._drag_motion)
+            w.bind("<ButtonRelease-1>", self._drag_end)
+            w.bind("<MouseWheel>",      self._on_scroll)
+            w.bind("<ButtonPress-3>",   self._show_menu)
+        self._drag_x = self._drag_y = 0
+        self._update_scale_label()
+
+    def _update_scale_label(self):
+        self._lbl_scale.config(text=f"{self.meters_per_px * self.SIZE / 1000:.1f} km")
+
+    def redraw(self, points, current_pos, heading_deg):
+        self.canvas.delete("all")
+        if current_pos is None:
+            self.canvas.create_text(self.SIZE / 2, self.SIZE / 2, text="--",
+                                     fill="#888888", font=("Consolas", 10))
+            return
+
+        cx, cz = current_pos
+        c = self.SIZE / 2
+        mpp = self.meters_per_px
+
+        def to_screen(px, pz):
+            return (c + (px - cx) / mpp, c - (pz - cz) / mpp)
+
+        if len(points) >= 2:
+            coords = []
+            for px, pz in points:
+                sx, sy = to_screen(px, pz)
+                coords.extend([sx, sy])
+            self.canvas.create_line(*coords, fill=self.LINE_COLOR, width=2, smooth=True)
+
+        # Pfeil (Fahrtrichtung) am aktuellen Standort
+        ang = math.radians(heading_deg)
+        size = 7
+        tip   = (c + size * math.sin(ang),         c - size * math.cos(ang))
+        left  = (c - size * 0.6 * math.cos(ang),    c - size * 0.6 * math.sin(ang))
+        right = (c + size * 0.6 * math.cos(ang),    c + size * 0.6 * math.sin(ang))
+        self.canvas.create_polygon(*tip, *left, *right, fill=self.NOW_COLOR, outline="")
+
+    def _drag_start(self, event):
+        self._drag_x, self._drag_y = event.x, event.y
+
+    def _drag_motion(self, event):
+        x = self.winfo_x() + (event.x - self._drag_x)
+        y = self.winfo_y() + (event.y - self._drag_y)
+        self.geometry(f"+{x}+{y}")
+
+    def _drag_end(self, event):
+        self.settings["trail_widget"]["x"] = self.winfo_x()
+        self.settings["trail_widget"]["y"] = self.winfo_y()
+        self.on_change()
+
+    def _on_scroll(self, event):
+        factor = 1.2 if event.delta > 0 else (1 / 1.2)
+        self.meters_per_px = min(max(self.meters_per_px * factor, 0.5), 200.0)
+        self._update_scale_label()
+        self.settings["trail_widget"]["meters_per_px"] = self.meters_per_px
+        self.on_change()
+
+    def _show_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, bg="#1A1A2E", fg="#CCCCCC",
+                        activebackground="#4FC3F7", activeforeground="#000000")
+        menu.add_command(label="Spur zurücksetzen", command=lambda: self.on_change(clear_trail=True))
+        menu.add_command(label="Ausblenden", command=self._hide)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _hide(self):
+        self.settings["trail_widget"]["enabled"] = False
+        self.on_change(relayout=True)
+
+
+# ──────────────────────────────────────────────
 # Einstellungsfenster: Sichtbarkeit / Losgelöst pro Wert
 # ──────────────────────────────────────────────
 class SettingsWindow(tk.Toplevel):
@@ -474,8 +592,11 @@ class ETS2Overlay:
 
         self._detached      = {}   # metric_id -> DetachedWidget
         self._value_labels  = {}   # metric_id -> Label (nur wenn inline im Panel)
+        self._trail_widget  = None
+        self._trail_points  = deque(maxlen=2000)  # ~16 Min. Spur bei 500ms Polling
         self._build_ui()
         self._sync_detached_widgets()
+        self._sync_trail_widget()
 
         self._hw_stats   = {}
         self._ets_data   = None
@@ -486,6 +607,10 @@ class ETS2Overlay:
         # EMA-Zustand zur Schätzung der tatsächlichen Ankunftszeit
         self._eta_rate_ema    = None
         self._eta_last_sample = None
+        # Aus Positionsänderung abgeleitete Fahrtrichtung (kein rotationX
+        # noetig -- selbstkalibrierend, unabhaengig von SCS-Achsenkonvention)
+        self._heading_deg   = 0.0
+        self._last_pos      = None
 
         # Background-Threads für Stats
         threading.Thread(target=self._hw_loop,   daemon=True).start()
@@ -557,6 +682,7 @@ class ETS2Overlay:
             child.destroy()
         self._build_ui()
         self._sync_detached_widgets()
+        self._sync_trail_widget()
 
     def _sync_detached_widgets(self):
         for mid, sect, label in METRIC_DEFS:
@@ -570,7 +696,22 @@ class ETS2Overlay:
                 self._detached[mid].destroy()
                 del self._detached[mid]
 
-    def _on_widget_change(self, relayout=False):
+    def _sync_trail_widget(self):
+        want = self.settings["trail_widget"]["enabled"]
+        have = self._trail_widget is not None
+        if want and not have:
+            self._trail_widget = TrailWidget(self.root, self.settings, self._on_widget_change)
+        elif not want and have:
+            self._trail_widget.destroy()
+            self._trail_widget = None
+
+    def _toggle_trail_widget(self):
+        self.settings["trail_widget"]["enabled"] = not self.settings["trail_widget"]["enabled"]
+        self._on_widget_change(relayout=True)
+
+    def _on_widget_change(self, relayout=False, clear_trail=False):
+        if clear_trail:
+            self._trail_points.clear()
         save_settings(self.settings)
         if relayout:
             self._rebuild_layout()
@@ -593,9 +734,28 @@ class ETS2Overlay:
             data = read_telemetry()
             if data is not None:
                 data["eta_real"] = self._estimate_real_eta(data)
+                self._track_position(data["pos_x"], data["pos_z"])
             with self._lock:
                 self._ets_data = data
             time.sleep(self.REFRESH_ETS / 1000)
+
+    TRAIL_MIN_MOVE_M = 3.0  # Mindestbewegung (Meter), bevor ein neuer Punkt/Heading gilt
+
+    def _track_position(self, x, z):
+        """Sammelt die Spur-Punkte und leitet die Fahrtrichtung direkt aus
+        der Positionsänderung ab (kein rotationX nötig -- funktioniert
+        unabhängig von SCS' Achsenkonvention, da rein aus Ist-Bewegung)."""
+        if self._last_pos is not None:
+            dx = x - self._last_pos[0]
+            dz = z - self._last_pos[1]
+            dist = math.hypot(dx, dz)
+            if dist >= self.TRAIL_MIN_MOVE_M:
+                self._heading_deg = math.degrees(math.atan2(dx, dz))
+                self._trail_points.append((x, z))
+                self._last_pos = (x, z)
+        else:
+            self._trail_points.append((x, z))
+            self._last_pos = (x, z)
 
     ETA_RATE_EMA_ALPHA = 0.10  # Anpassgeschwindigkeit an Zonenwechsel Stadt/Autobahn
     ETA_RATE_DEFAULT   = 15.0  # Startwert bis zur ersten Messung (Mix aus 3x Stadt/19x Autobahn)
@@ -721,6 +881,10 @@ class ETS2Overlay:
             if widget is not None:
                 widget.set_value(text, color)
 
+        if self._trail_widget is not None:
+            current_pos = self._last_pos if ets is not None else None
+            self._trail_widget.redraw(list(self._trail_points), current_pos, self._heading_deg)
+
         # Log-Status Footer aktualisieren
         if self._logging_on:
             self.lbl_log_status.config(
@@ -755,6 +919,9 @@ class ETS2Overlay:
         menu.add_command(label="Transparenz: 90%",  command=lambda: self.root.wm_attributes("-alpha", 0.9))
         menu.add_separator()
         menu.add_command(label="Anzeige anpassen...", command=self._open_settings_window)
+        trail_label = ("Spur-Karte ausblenden" if self.settings["trail_widget"]["enabled"]
+                       else "Spur-Karte anzeigen")
+        menu.add_command(label=trail_label, command=self._toggle_trail_widget)
         menu.add_separator()
         log_label = "Logging PAUSIEREN" if self._logging_on else "Logging STARTEN"
         menu.add_command(label=log_label, command=self._toggle_logging)
